@@ -1,0 +1,10 @@
+services:
+  prompt-enhancer:
+    build: 
+      context: .
+      args:
+        HF_TOKEN: ${HF_TOKEN}  # Токен будет браться из переменных окружения
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./models:/app/models  # Монтируем директорию с моделями
