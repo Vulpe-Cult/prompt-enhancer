@@ -1,4 +1,5 @@
 import os
+import re  # Важно: этот импорт должен быть в начале файла
 from flask import Flask, request, jsonify
 from llama_cpp import Llama
 import requests
@@ -12,7 +13,7 @@ app = Flask(__name__)
 # Конфигурация модели
 MODEL_PATH = "/app/models/mistral-7b-instruct-v0.1.Q4_0.gguf"
 MODEL_URL = "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.1-GGUF/resolve/main/mistral-7b-instruct-v0.1.Q4_0.gguf"
-HF_TOKEN = os.getenv("HF_TOKEN")  # Получаем токен из переменных окружения
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 if not HF_TOKEN:
     raise ValueError("Hugging Face token not found. Please set HF_TOKEN in .env file")
@@ -45,46 +46,65 @@ if not os.path.exists(MODEL_PATH):
     print("Model not found, downloading...")
     download_model()
 
-# Инициализируем модель
+# Инициализируем модель с более оптимальными параметрами
 try:
-    llm = Llama(model_path=MODEL_PATH)
+    llm = Llama(
+        model_path=MODEL_PATH,
+        n_ctx=2048,
+        n_threads=4,
+        verbose=False  # Отключаем лишние логи llama.cpp
+    )
+    print("Model loaded successfully")
 except Exception as e:
     print(f"Failed to load model: {e}")
     raise
 
 def generate_positive_prompt(russian_prompt):
     """Генерирует позитивный промпт на основе русского описания"""
-    instruction = f"""Ты профессиональный генератор промптов для Stable Diffusion. 
-    Преобразуй русский промпт в детализированное английское описание через запятую.
-    Промпт: "{russian_prompt}"
+    # Упрощенный и более четкий промпт для модели
+    instruction = f"""Переведи на английский и улучши этот промпт для Stable Diffusion. 
+    Сделай его детализированным и конкретным. Ответ должен быть только на английском, 
+    в формате: "детальное описание, художественный стиль, качество".
     
-    Включи:
-    - Детали персонажа/объекта
-    - Окружение и фон
-    - Художественный стиль
-    - Качество и детализацию
+    Исходный промпт: "{russian_prompt}"
     
-    Только английский язык, без комментариев."""
+    Пример хорошего ответа:
+    "a modern living room with large windows, leather sofa and abstract paintings on the walls, 
+    minimalist design with warm lighting, ultra detailed, 4k, photorealistic"
+    """
     
     try:
+        # Убираем дублирующийся <s> из промпта (видно из логов предупреждение)
         response = llm(
-            f"<s>[INST] {instruction} [/INST]",
-            max_tokens=300,
+            f"[INST] {instruction} [/INST]",
+            max_tokens=400,
             temperature=0.7,
             top_p=0.9,
             stop=["</s>"],
             echo=False
         )
+        
         prompt = response['choices'][0]['text'].strip()
-        # Очистка промпта
-        return re.sub(r'[\"\'\[\]]', '', prompt).strip()
+        
+        # Упрощенная очистка промпта
+        prompt = prompt.replace('"', '').replace("'", "").strip()
+        if not prompt:
+            return "high quality digital artwork"
+            
+        return prompt
     except Exception as e:
-        print(f"Prompt generation failed: {e}")
+        print(f"Prompt generation error: {str(e)}")
         return "high quality digital artwork"
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "ok",
+        "model": "loaded" if os.path.exists(MODEL_PATH) else "missing"
+    })
 
 @app.route("/enhance", methods=["POST"])
 def enhance_prompt():
-    """Основной endpoint для генерации промптов"""
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
         
@@ -99,14 +119,15 @@ def enhance_prompt():
         
         return jsonify({
             "positive": positive_prompt,
-            "negative": DEFAULT_NEGATIVE_PROMPT
+            "negative": DEFAULT_NEGATIVE_PROMPT,
+            "input_text": input_text
         })
     except Exception as e:
         return jsonify({
-            "positive": "high quality digital art",
+            "positive": "high quality digital artwork",
             "negative": DEFAULT_NEGATIVE_PROMPT,
             "error": str(e)
         }), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8001)
+    app.run(host="0.0.0.0", port=8001, debug=True)
