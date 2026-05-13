@@ -1,22 +1,34 @@
 import os
-import re  # Важно: этот импорт должен быть в начале файла
+import re
+import logging
 from flask import Flask, request, jsonify
-from llama_cpp import Llama
-import requests
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения из .env файла
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Загружаем переменные окружения из .env
 load_dotenv()
 
 app = Flask(__name__)
 
-# Конфигурация модели
-MODEL_PATH = "/app/models/mistral-7b-instruct-v0.1.Q4_0.gguf"
-MODEL_URL = "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.1-GGUF/resolve/main/mistral-7b-instruct-v0.1.Q4_0.gguf"
+# Конфигурация из переменных окружения
+MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/mistral-7b-instruct-v0.1.Q4_0.gguf")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 if not HF_TOKEN:
-    raise ValueError("Hugging Face token not found. Please set HF_TOKEN in .env file")
+    raise ValueError("HF_TOKEN not found. Please set it in .env file")
+
+LLAMA_N_CTX = int(os.getenv("LLAMA_N_CTX", "2048"))
+LLAMA_N_THREADS = int(os.getenv("LLAMA_N_THREADS", "4"))
+LLAMA_VERBOSE = os.getenv("LLAMA_VERBOSE", "false").lower() == "true"
+
+# Глобальная переменная для ленивой инициализации модели
+_llm = None
 
 DEFAULT_NEGATIVE_PROMPT = (
     "low quality, blurry, distorted anatomy, extra limbs, deformed hands, bad proportions, "
@@ -25,57 +37,40 @@ DEFAULT_NEGATIVE_PROMPT = (
     "signature, out of focus, long neck, extra arms, extra legs, fused fingers"
 )
 
-def download_model():
-    """Скачивает модель, если она отсутствует"""
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    try:
-        with requests.get(MODEL_URL, headers=headers, stream=True) as r:
-            r.raise_for_status()
-            with open(MODEL_PATH, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        print("Model downloaded successfully")
-    except Exception as e:
-        print(f"Failed to download model: {e}")
-        raise
-
-# Проверяем и скачиваем модель при запуске
-if not os.path.exists(MODEL_PATH):
-    print("Model not found, downloading...")
-    download_model()
-
-# Инициализируем модель с более оптимальными параметрами
-try:
-    llm = Llama(
-        model_path=MODEL_PATH,
-        n_ctx=2048,
-        n_threads=4,
-        verbose=False  # Отключаем лишние логи llama.cpp
-    )
-    print("Model loaded successfully")
-except Exception as e:
-    print(f"Failed to load model: {e}")
-    raise
+def get_llm():
+    """Ленивая загрузка модели (только при первом вызове)"""
+    global _llm
+    if _llm is None:
+        from llama_cpp import Llama
+        logger.info(f"Loading model from {MODEL_PATH}")
+        if not os.path.exists(MODEL_PATH):
+            raise FileNotFoundError(
+                f"Model not found at {MODEL_PATH}. "
+                "Run download_model.py first or check volume mount."
+            )
+        _llm = Llama(
+            model_path=MODEL_PATH,
+            n_ctx=LLAMA_N_CTX,
+            n_threads=LLAMA_N_THREADS,
+            verbose=LLAMA_VERBOSE
+        )
+        logger.info("Model loaded successfully")
+    return _llm
 
 def generate_positive_prompt(russian_prompt):
     """Генерирует позитивный промпт на основе русского описания"""
-    # Упрощенный и более четкий промпт для модели
-    instruction = f"""Переведи на английский и улучши этот промпт для Stable Diffusion. 
-    Сделай его детализированным и конкретным. Ответ должен быть только на английском, 
-    в формате: "детальное описание, художественный стиль, качество".
-    
-    Исходный промпт: "{russian_prompt}"
-    
-    Пример хорошего ответа:
-    "a modern living room with large windows, leather sofa and abstract paintings on the walls, 
-    minimalist design with warm lighting, ultra detailed, 4k, photorealistic"
-    """
-    
+    instruction = f"""Convert the following Russian prompt into an English prompt for Stable Diffusion.
+Make it detailed, specific, and include style and quality keywords.
+Respond ONLY with the English prompt, no extra text.
+
+Original prompt: "{russian_prompt}"
+
+Example of a good response:
+"a futuristic city with flying cars, neon lights, cyberpunk style, highly detailed, 8k, cinematic lighting"
+""
     try:
-        # Убираем дублирующийся <s> из промпта (видно из логов предупреждение)
-        response = llm(
+        llm_instance = get_llm()
+        response = llm_instance(
             f"[INST] {instruction} [/INST]",
             max_tokens=400,
             temperature=0.7,
@@ -83,51 +78,56 @@ def generate_positive_prompt(russian_prompt):
             stop=["</s>"],
             echo=False
         )
-        
         prompt = response['choices'][0]['text'].strip()
-        
-        # Упрощенная очистка промпта
-        prompt = prompt.replace('"', '').replace("'", "").strip()
+        prompt = re.sub(r'["\']', '', prompt).strip()
         if not prompt:
+            logger.warning("Empty prompt generated, using fallback")
             return "high quality digital artwork"
-            
+        logger.info(f"Generated prompt for input: {russian_prompt[:50]}...")
         return prompt
     except Exception as e:
-        print(f"Prompt generation error: {str(e)}")
+        logger.error(f"Prompt generation error: {str(e)}")
         return "high quality digital artwork"
 
 @app.route("/health", methods=["GET"])
 def health_check():
+    try:
+        get_llm()  # проверяем, что модель загружается (или уже загружена)
+        model_status = "loaded"
+    except Exception as e:
+        model_status = f"error: {str(e)}"
     return jsonify({
         "status": "ok",
-        "model": "loaded" if os.path.exists(MODEL_PATH) else "missing"
+        "model_status": model_status
     })
 
 @app.route("/enhance", methods=["POST"])
 def enhance_prompt():
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
-        
+
     data = request.get_json()
     input_text = data.get("text", "").strip()
-    
+
     if not input_text:
         return jsonify({"error": "Text is required"}), 400
-    
+
     try:
         positive_prompt = generate_positive_prompt(input_text)
-        
         return jsonify({
             "positive": positive_prompt,
             "negative": DEFAULT_NEGATIVE_PROMPT,
             "input_text": input_text
         })
     except Exception as e:
+        logger.exception("Unexpected error in /enhance")
         return jsonify({
             "positive": "high quality digital artwork",
             "negative": DEFAULT_NEGATIVE_PROMPT,
             "error": str(e)
         }), 500
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8001, debug=True)
+    debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host="0.0.0.0", port=8001, debug=debug_mode)
